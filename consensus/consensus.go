@@ -3,6 +3,7 @@ package consensus
 import (
 	"context"
 	"log"
+	"time"
 
 	"github.com/0xPolygon/polygon-edge/blockchain"
 	"github.com/0xPolygon/polygon-edge/chain"
@@ -19,46 +20,40 @@ import (
 // Consensus is the public interface for consensus mechanism
 // Each consensus mechanism must implement this interface in order to be valid
 type Consensus interface {
-	// VerifyHeader verifies the header is correct
+	// VerifyHeader verifies the header is correct (e.g., timestamp, signature, validator)
 	VerifyHeader(header *types.Header) error
 
-	// ProcessHeaders updates the snapshot based on the verified headers
+	// ProcessHeaders updates the validator snapshot based on verified headers
 	ProcessHeaders(headers []*types.Header) error
 
-	// GetBlockCreator retrieves the block creator (or signer) given the block header
+	// GetBlockCreator retrieves the block creator (validator) for the given block
 	GetBlockCreator(header *types.Header) (types.Address, error)
 
-	// PreCommitState a hook to be called before finalizing state transition on inserting block
+	// PreCommitState hook before finalizing the block
 	PreCommitState(header *types.Header, txn *state.Transition) error
 
-	// GetSyncProgression retrieves the current sync progression, if any
+	// GetSyncProgression returns sync progress (used during node catch-up)
 	GetSyncProgression() *progress.Progression
 
-	// Initialize initializes the consensus (e.g. setup data)
+	// Initialize sets up consensus-specific state/data
 	Initialize() error
 
-	// Start starts the consensus and servers
+	// Start launches the consensus mechanism loop and its network services
 	Start() error
 
-	// Close closes the connection
+	// Close terminates the consensus services
 	Close() error
 }
 
-// Config is the configuration for the consensus
+// Config holds the configuration for the consensus
 type Config struct {
-	// Logger to be used by the consensus
-	Logger *log.Logger
-
-	// Params are the params of the chain and the consensus
-	Params *chain.Params
-
-	// Config defines specific configuration parameters for the consensus
-	Config map[string]interface{}
-
-	// Path is the directory path for the consensus protocol tos tore information
-	Path string
+	Logger *log.Logger            // Logger for consensus-level logging
+	Params *chain.Params          // Chain parameters (e.g., block time, genesis validators)
+	Config map[string]interface{} // Consensus-specific key-values
+	Path   string                 // File path for consensus storage
 }
 
+// Params encapsulates parameters required to start the consensus mechanism
 type Params struct {
 	Context        context.Context
 	Config         *Config
@@ -72,5 +67,10 @@ type Params struct {
 	BlockTime      uint64
 }
 
-// Factory is the factory function to create a discovery consensus
+// Factory is a function to instantiate a new consensus mechanism
 type Factory func(*Params) (Consensus, error)
+
+// Constants to enforce your 0.2 second blocks and advanced security features
+const (
+	TargetBlockTime = 200 * time.Millisecond // 0.2s block production interval
+)
