@@ -1,29 +1,27 @@
+// File: chain/params.go
 package chain
 
-import (
-	"math/big"
+import "time"
 
-	"github.com/0xPolygon/polygon-edge/types"
-)
-
-// Params are all the set of params for the chain
+// Params holds the configurable network parameters.
 type Params struct {
-	Forks          *Forks                 `json:"forks"`
-	ChainID        int                    `json:"chainID"`
-	Engine         map[string]interface{} `json:"engine"`
-	Whitelists     *Whitelists            `json:"whitelists,omitempty"`
-	BlockGasTarget uint64                 `json:"blockGasTarget"`
+    ChainID       int
+    BlockTime     time.Duration // Block interval
+    GasLimit      uint64
+    MaxValidators int
+    TokenStandard string
 }
 
-func (p *Params) GetEngine() string {
-	// We know there is already one
-	for k := range p.Engine {
-		return k
-	}
-
-	return ""
+// DefaultParams returns the default parameters for ACryptoChain mainnet.
+func DefaultParams() *Params {
+    return &Params{
+        ChainID:       20030,                      // Mainnet chain ID
+        BlockTime:     200 * time.Millisecond,     // 0.2 second blocks
+        GasLimit:      8000000,
+        MaxValidators: 21,
+        TokenStandard: "ACC-20",                   // Our token standard
+    }
 }
-
 // Whitelists specifies supported whitelists
 type Whitelists struct {
 	Deployment []types.Address `json:"deployment,omitempty"`
