@@ -1,123 +1,77 @@
-package validators
+package ibft
 
 import (
-	"errors"
 	"math"
+
+	"github.com/0xPolygon/polygon-edge/types"
+	"github.com/0xPolygon/polygon-edge/validators"
 )
 
-// Validator represents an individual validator in the network.
-type Validator struct {
-	Address string // Unique identifier (e.g., hex address)
-	PubKey  string // Public key (BLS public key as per configuration)
-	Stake   uint64 // Amount staked by the validator
-	Active  bool   // Whether the validator is active in consensus
+// CalcMaxFaultyNodes calculates the maximum number of faulty nodes allowed
+// in the IBFT consensus algorithm based on the size of the validator set.
+func CalcMaxFaultyNodes(s validators.Validators) int {
+	// N -> number of nodes in IBFT
+	// F -> number of faulty nodes
+	//
+	// N = 3F + 1
+	// => F = (N - 1) / 3
+	//
+	// IBFT tolerates 1 failure with 4 nodes
+	// 4 = 3 * 1 + 1
+	// To tolerate 2 failures, IBFT requires 7 nodes
+	// 7 = 3 * 2 + 1
+	// It should always take the floor of the result
+	return (s.Len() - 1) / 3
 }
 
-// ValidatorSet manages the collection of validators.
-type ValidatorSet struct {
-	validators map[string]*Validator // Map keyed by validator address
+// QuorumImplementation defines a function type that calculates quorum size
+type QuorumImplementation func(validators.Validators) int
+
+// LegacyQuorumSize returns the legacy quorum size for the given validator set
+func LegacyQuorumSize(set validators.Validators) int {
+	// According to the IBFT spec, the number of valid messages
+	// needs to be 2F + 1
+	return 2*CalcMaxFaultyNodes(set) + 1
 }
 
-// NewValidatorSet creates a new ValidatorSet with an optional initial list of validators.
-func NewValidatorSet(initialValidators []*Validator) *ValidatorSet {
-	vs := &ValidatorSet{
-		validators: make(map[string]*Validator),
+// OptimalQuorumSize returns the optimal quorum size for the given validator set
+func OptimalQuorumSize(set validators.Validators) int {
+	// If the number of validators is less than 4,
+	// then the entire set is required
+	if CalcMaxFaultyNodes(set) == 0 {
+		/*
+			N: 1 -> Q: 1
+			N: 2 -> Q: 2
+			N: 3 -> Q: 3
+		*/
+		return set.Len()
 	}
-	for _, v := range initialValidators {
-		vs.validators[v.Address] = v
-	}
-	return vs
+	// (quorum optimal) Q = ceil(2/3 * N)
+	return int(math.Ceil(2.0 * float64(set.Len()) / 3.0))
 }
 
-// RegisterValidator adds a new validator to the set after performing necessary checks.
-func (vs *ValidatorSet) RegisterValidator(v *Validator) error {
-	if v == nil {
-		return errors.New("validator is nil")
-	}
-	if v.Address == "" {
-		return errors.New("validator address is empty")
-	}
-	if v.PubKey == "" {
-		return errors.New("validator public key is empty")
-	}
-	if _, exists := vs.validators[v.Address]; exists {
-		return errors.New("validator already exists")
-	}
-	v.Active = true
-	vs.validators[v.Address] = v
-	return nil
-}
-
-// RemoveValidator removes a validator by its address.
-func (vs *ValidatorSet) RemoveValidator(address string) error {
-	if address == "" {
-		return errors.New("address is empty")
-	}
-	if _, exists := vs.validators[address]; !exists {
-		return errors.New("validator not found")
-	}
-	delete(vs.validators, address)
-	return nil
-}
-
-// GetActiveValidators returns all validators that are currently active.
-func (vs *ValidatorSet) GetActiveValidators() []*Validator {
-	active := make([]*Validator, 0)
-	for _, v := range vs.validators {
-		if v.Active {
-			active = append(active, v)
+// CalcProposer determines the proposer for the current round
+func CalcProposer(
+	validators validators.Validators,
+	round uint64,
+	lastProposer types.Address,
+) validators.Validator {
+	var seed uint64
+	if lastProposer == types.ZeroAddress {
+		seed = round
+	} else {
+		offset := int64(0)
+		if index := validators.Index(lastProposer); index != -1 {
+			offset = int64(index)
 		}
+		seed = uint64(offset) + round + 1
 	}
-	return active
-}
 
-// RequiredVotes computes the number of validator votes required for block finality.
-// It typically returns 2/3 of the active validators plus one.
-func (vs *ValidatorSet) RequiredVotes() int {
-	active := vs.GetActiveValidators()
-	total := len(active)
-	if total == 0 {
-		return 0
-	}
-	required := int(math.Floor(float64(total)*2/3)) + 1
-	if required > total {
-		required = total
-	}
-	return required
-}
-
-// UpdateValidatorStake updates the stake for the given validator address.
-func (vs *ValidatorSet) UpdateValidatorStake(address string, newStake uint64) error {
-	if v, exists := vs.validators[address]; exists {
-		v.Stake = newStake
+	// Check if validators set is empty
+	if validators.Len() == 0 {
 		return nil
 	}
-	return errors.New("validator not found")
-}
 
-// DeactivateValidator marks the validator as inactive without removing it.
-func (vs *ValidatorSet) DeactivateValidator(address string) error {
-	if v, exists := vs.validators[address]; exists {
-		v.Active = false
-		return nil
-	}
-	return errors.New("validator not found")
-}
-
-// ActivateValidator marks the validator as active.
-func (vs *ValidatorSet) ActivateValidator(address string) error {
-	if v, exists := vs.validators[address]; exists {
-		v.Active = true
-		return nil
-	}
-	return errors.New("validator not found")
-}
-
-// ListAllValidators returns all validators, active or not.
-func (vs *ValidatorSet) ListAllValidators() []*Validator {
-	all := make([]*Validator, 0)
-	for _, v := range vs.validators {
-		all = append(all, v)
-	}
-	return all
+	pick := seed % uint64(validators.Len())
+	return validators.At(int(pick))
 }
