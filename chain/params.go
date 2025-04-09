@@ -1,30 +1,41 @@
 // File: chain/params.go
 package chain
 
-import "time"
+import (
+	"math/big"
+	"time"
+)
+
+// Missing import for types package
+type Address []byte
 
 // Params holds the configurable network parameters.
 type Params struct {
-    ChainID       int
-    BlockTime     time.Duration // Block interval
-    GasLimit      uint64
-    MaxValidators int
-    TokenStandard string
+	ChainID       int
+	BlockTime     time.Duration // Block interval
+	GasLimit      uint64
+	MaxValidators int
+	TokenStandard string
+	Whitelists    *Whitelists   // Added reference to Whitelists
+	Forks         *Forks        // Added reference to Forks
 }
 
 // DefaultParams returns the default parameters for ACryptoChain mainnet.
 func DefaultParams() *Params {
-    return &Params{
-        ChainID:       20030,                      // Mainnet chain ID
-        BlockTime:     200 * time.Millisecond,     // 0.2 second blocks
-        GasLimit:      8000000,
-        MaxValidators: 21,
-        TokenStandard: "ACC-20",                   // Our token standard
-    }
+	return &Params{
+		ChainID:       20030,                  // Mainnet chain ID
+		BlockTime:     200 * time.Millisecond, // 0.2 second blocks
+		GasLimit:      8000000,
+		MaxValidators: 21,
+		TokenStandard: "ACC-20", // Our token standard
+		Whitelists:    &Whitelists{},
+		Forks:         AllForksEnabled,
+	}
 }
+
 // Whitelists specifies supported whitelists
 type Whitelists struct {
-	Deployment []types.Address `json:"deployment,omitempty"`
+	Deployment []Address `json:"deployment,omitempty"`
 }
 
 // Forks specifies when each fork is activated
@@ -43,7 +54,6 @@ func (f *Forks) active(ff *Fork, block uint64) bool {
 	if ff == nil {
 		return false
 	}
-
 	return ff.Active(block)
 }
 
@@ -75,6 +85,10 @@ func (f *Forks) IsEIP155(block uint64) bool {
 	return f.active(f.EIP155, block)
 }
 
+func (f *Forks) IsIstanbul(block uint64) bool {
+	return f.active(f.Istanbul, block)
+}
+
 func (f *Forks) At(block uint64) ForksInTime {
 	return ForksInTime{
 		Homestead:      f.active(f.Homestead, block),
@@ -92,7 +106,6 @@ type Fork uint64
 
 func NewFork(n uint64) *Fork {
 	f := Fork(n)
-
 	return &f
 }
 
