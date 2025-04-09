@@ -157,56 +157,77 @@ func (g *Genesis) UnmarshalJSON(data []byte) error {
 
 	var dec Genesis
 	if err := json.Unmarshal(data, &dec); err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal genesis JSON: %w", err)
 	}
 
-	var err, subErr error
+	var errs *multierror.Error
 
 	parseError := func(field string, subErr error) {
-		err = multierror.Append(err, fmt.Errorf("%s: %w", field, subErr))
+		errs = multierror.Append(errs, fmt.Errorf("%s: %w", field, subErr))
 	}
 
-	nonce, subErr := types.ParseUint64orHex(dec.Nonce)
-	if subErr != nil {
-		parseError("nonce", subErr)
+	// Required field check
+	if dec.GasLimit == nil {
+		errs = multierror.Append(errs, fmt.Errorf("field 'gaslimit' is required"))
 	}
 
-	binary.BigEndian.PutUint64(g.Nonce[:], nonce)
-
-	g.Timestamp, subErr = types.ParseUint64orHex(dec.Timestamp)
-	if subErr != nil {
-		parseError("timestamp", subErr)
+	// Parse Nonce
+	if dec.Nonce != nil {
+		nonce, subErr := types.ParseUint64orHex(dec.Nonce)
+		if subErr != nil {
+			parseError("nonce", subErr)
+		} else {
+			binary.BigEndian.PutUint64(g.Nonce[:], nonce)
+		}
 	}
 
+	// Parse Timestamp
+	if dec.Timestamp != nil {
+		var subErr error
+		g.Timestamp, subErr = types.ParseUint64orHex(dec.Timestamp)
+		if subErr != nil {
+			parseError("timestamp", subErr)
+		}
+	}
+
+	// Parse ExtraData
 	if dec.ExtraData != nil {
+		var subErr error
 		g.ExtraData, subErr = types.ParseBytes(dec.ExtraData)
 		if subErr != nil {
 			parseError("extradata", subErr)
 		}
 	}
 
-	if dec.GasLimit == nil {
-		return fmt.Errorf("field 'gaslimit' is required")
+	// Parse GasLimit
+	if dec.GasLimit != nil {
+		var subErr error
+		g.GasLimit, subErr = types.ParseUint64orHex(dec.GasLimit)
+		if subErr != nil {
+			parseError("gaslimit", subErr)
+		}
 	}
 
-	g.GasLimit, subErr = types.ParseUint64orHex(dec.GasLimit)
-	if subErr != nil {
-		parseError("gaslimit", subErr)
+	// Parse Difficulty
+	if dec.Difficulty != nil {
+		var subErr error
+		g.Difficulty, subErr = types.ParseUint64orHex(dec.Difficulty)
+		if subErr != nil {
+			parseError("difficulty", subErr)
+		}
 	}
 
-	g.Difficulty, subErr = types.ParseUint64orHex(dec.Difficulty)
-	if subErr != nil {
-		parseError("difficulty", subErr)
-	}
-
+	// Parse Mixhash
 	if dec.Mixhash != nil {
 		g.Mixhash = *dec.Mixhash
 	}
 
+	// Parse Coinbase
 	if dec.Coinbase != nil {
 		g.Coinbase = *dec.Coinbase
 	}
 
+	// Parse Alloc
 	if dec.Alloc != nil {
 		g.Alloc = make(map[types.Address]*GenesisAccount, len(dec.Alloc))
 		for k, v := range dec.Alloc {
@@ -214,21 +235,30 @@ func (g *Genesis) UnmarshalJSON(data []byte) error {
 		}
 	}
 
-	g.Number, subErr = types.ParseUint64orHex(dec.Number)
-	if subErr != nil {
-		parseError("number", subErr)
+	// Parse Number
+	if dec.Number != nil {
+		var subErr error
+		g.Number, subErr = types.ParseUint64orHex(dec.Number)
+		if subErr != nil {
+			parseError("number", subErr)
+		}
 	}
 
-	g.GasUsed, subErr = types.ParseUint64orHex(dec.GasUsed)
-	if subErr != nil {
-		parseError("gasused", subErr)
+	// Parse GasUsed
+	if dec.GasUsed != nil {
+		var subErr error
+		g.GasUsed, subErr = types.ParseUint64orHex(dec.GasUsed)
+		if subErr != nil {
+			parseError("gasused", subErr)
+		}
 	}
 
+	// Parse ParentHash
 	if dec.ParentHash != nil {
 		g.ParentHash = *dec.ParentHash
 	}
 
-	return err
+	return errs.ErrorOrNil()
 }
 
 // Genesis alloc
@@ -250,8 +280,7 @@ type genesisAccountEncoder struct {
 	PrivateKey *string                   `json:"secretKey,omitempty"`
 }
 
-// ENCODING //
-
+// MarshalJSON implements the json interface for GenesisAccount
 func (g *GenesisAccount) MarshalJSON() ([]byte, error) {
 	obj := &genesisAccountEncoder{}
 
@@ -278,8 +307,7 @@ func (g *GenesisAccount) MarshalJSON() ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-// DECODING //
-
+// UnmarshalJSON implements the json interface for GenesisAccount
 func (g *GenesisAccount) UnmarshalJSON(data []byte) error {
 	type GenesisAccount struct {
 		Code       *string                   `json:"code,omitempty"`
@@ -291,49 +319,62 @@ func (g *GenesisAccount) UnmarshalJSON(data []byte) error {
 
 	var dec GenesisAccount
 	if err := json.Unmarshal(data, &dec); err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal GenesisAccount: %w", err)
 	}
 
-	var err error
-
-	var subErr error
+	var errs *multierror.Error
 
 	parseError := func(field string, subErr error) {
-		err = multierror.Append(err, fmt.Errorf("%s: %w", field, subErr))
+		errs = multierror.Append(errs, fmt.Errorf("%s: %w", field, subErr))
 	}
 
+	// Parse Code
 	if dec.Code != nil {
+		var subErr error
 		g.Code, subErr = types.ParseBytes(dec.Code)
 		if subErr != nil {
 			parseError("code", subErr)
 		}
 	}
 
+	// Parse Storage
 	if dec.Storage != nil {
 		g.Storage = dec.Storage
 	}
 
-	g.Balance, subErr = types.ParseUint256orHex(dec.Balance)
-	if subErr != nil {
-		parseError("balance", subErr)
+	// Parse Balance (required field)
+	if dec.Balance == nil {
+		errs = multierror.Append(errs, fmt.Errorf("field 'balance' is required"))
+	} else {
+		var subErr error
+		g.Balance, subErr = types.ParseUint256orHex(dec.Balance)
+		if subErr != nil {
+			parseError("balance", subErr)
+		}
 	}
 
-	g.Nonce, subErr = types.ParseUint64orHex(dec.Nonce)
-
-	if subErr != nil {
-		parseError("nonce", subErr)
+	// Parse Nonce
+	if dec.Nonce != nil {
+		var subErr error
+		g.Nonce, subErr = types.ParseUint64orHex(dec.Nonce)
+		if subErr != nil {
+			parseError("nonce", subErr)
+		}
 	}
 
+	// Parse PrivateKey
 	if dec.PrivateKey != nil {
+		var subErr error
 		g.PrivateKey, subErr = types.ParseBytes(dec.PrivateKey)
 		if subErr != nil {
 			parseError("privatekey", subErr)
 		}
 	}
 
-	return err
+	return errs.ErrorOrNil()
 }
 
+// Import imports a chain from a file
 func Import(chain string) (*Chain, error) {
 	return ImportFromFile(chain)
 }
@@ -342,21 +383,41 @@ func Import(chain string) (*Chain, error) {
 func ImportFromFile(filename string) (*Chain, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read file '%s': %w", filename, err)
 	}
 
 	return importChain(data)
 }
 
+// importChain imports chain data from JSON content
 func importChain(content []byte) (*Chain, error) {
 	var chain *Chain
 
 	if err := json.Unmarshal(content, &chain); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal chain JSON: %w", err)
 	}
 
+	// Validate chain structure
+	if chain == nil {
+		return nil, fmt.Errorf("empty chain definition")
+	}
+
+	if chain.Params == nil {
+		return nil, fmt.Errorf("params field is required")
+	}
+
+	// Validate consensus engine
 	if engines := chain.Params.Engine; len(engines) != 1 {
 		return nil, fmt.Errorf("expected one consensus engine but found %d", len(engines))
+	}
+
+	// Validate bootnodes if present
+	if len(chain.Bootnodes) > 0 {
+		for i, node := range chain.Bootnodes {
+			if node == "" {
+				return nil, fmt.Errorf("bootnode %d is empty", i)
+			}
+		}
 	}
 
 	return chain, nil
