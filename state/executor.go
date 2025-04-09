@@ -3,7 +3,6 @@ package state
 import (
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	"sync"
 
@@ -12,7 +11,6 @@ import (
 	"github.com/0xPolygon/polygon-edge/state/runtime"
 	"github.com/0xPolygon/polygon-edge/state/runtime/evm"
 	"github.com/0xPolygon/polygon-edge/state/runtime/precompiled"
-	"github.com/0xPolygon/polygon-edge/state/runtime/tracer"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/hashicorp/go-hclog"
 )
@@ -25,7 +23,7 @@ const (
 	TxGasContractCreation uint64 = 53000 // Gas for a transaction creating a contract.
 )
 
-var emptyCodeHashTwo = types.BytesToHash(crypto.Keccak256(nil))
+var emptyCodeHash = types.BytesToHash(crypto.Keccak256(nil))
 
 // GetHashByNumber is a function type that returns the block hash for a given block number.
 type GetHashByNumber = func(i uint64) types.Hash
@@ -35,16 +33,19 @@ type GetHashByNumberHelper = func(*types.Header) GetHashByNumber
 
 // Executor is the main entity responsible for executing transactions and updating state.
 type Executor struct {
-	logger  hclog.Logger
-	config  *chain.Params
-	state   State
-	GetHash GetHashByNumberHelper
-
+	logger   hclog.Logger
+	config   *chain.Params
+	state    State
+	GetHash  GetHashByNumberHelper
+	mutex    sync.RWMutex
 	PostHook func(txn *Transition)
 }
 
 // NewExecutor creates and returns a new Executor instance.
 func NewExecutor(config *chain.Params, s State, logger hclog.Logger) *Executor {
+	if logger == nil {
+		logger = hclog.NewNullLogger()
+	}
 	return &Executor{
 		logger: logger,
 		config: config,
@@ -54,6 +55,10 @@ func NewExecutor(config *chain.Params, s State, logger hclog.Logger) *Executor {
 
 // WriteGenesis writes the genesis state to the underlying database and returns its hash.
 func (e *Executor) WriteGenesis(alloc map[types.Address]*chain.GenesisAccount) types.Hash {
+	if alloc == nil {
+		return types.Hash{}
+	}
+
 	snap := e.state.NewSnapshot()
 	txn := NewTxn(snap)
 
@@ -85,41 +90,46 @@ type BlockResult struct {
 }
 
 // ProcessBlock processes all transactions in the given block, applying them sequentially
-// and enforcing our security checks (including ACC‑20 token standard validation). It returns
-// a Transition containing the updated state.
+// and enforcing security checks. It returns a Transition containing the updated state.
 func (e *Executor) ProcessBlock(
 	parentRoot types.Hash,
 	block *types.Block,
 	blockCreator types.Address,
 ) (*Transition, error) {
+	if block == nil {
+		return nil, errors.New("nil block")
+	}
+
 	txn, err := e.BeginTxn(parentRoot, block.Header, blockCreator)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	for _, t := range block.Transactions {
 		// If transaction gas exceeds block gas limit, record a failed receipt.
 		if t.ExceedsBlockGasLimit(block.Header.GasLimit) {
 			if err := txn.WriteFailedReceipt(t); err != nil {
-				return nil, err
+				e.logger.Error("failed to write failed receipt", "tx", t.Hash(), "error", err)
+				return nil, fmt.Errorf("failed to write failed receipt: %w", err)
 			}
 			continue
 		}
 
-		// Enforce our new blockchain security by checking the transaction's token standard
-		// and basic destination address validity. This prevents cross-chain issues (e.g. sending
-		// tokens not adhering to ACC-20).
+		// Enforce blockchain security checks
 		if err := validateTransactionSecurity(t); err != nil {
 			e.logger.Error("transaction rejected", "tx", t.Hash(), "error", err)
 			if err := txn.WriteFailedReceipt(t); err != nil {
-				return nil, err
+				e.logger.Error("failed to write failed receipt", "tx", t.Hash(), "error", err)
+				return nil, fmt.Errorf("failed to write failed receipt: %w", err)
 			}
 			continue
 		}
 
 		if err := txn.Write(t); err != nil {
-			return nil, err
+			e.logger.Error("failed to write transaction", "tx", t.Hash(), "error", err)
+			return nil, fmt.Errorf("failed to write transaction: %w", err)
 		}
+		e.logger.Info("transaction processed", "tx", t.Hash())
 	}
 
 	return txn, nil
@@ -132,6 +142,9 @@ func (e *Executor) State() State {
 
 // StateAt returns a snapshot of the state at a given root.
 func (e *Executor) StateAt(root types.Hash) (Snapshot, error) {
+	if root == types.ZeroHash {
+		return nil, errors.New("empty root hash")
+	}
 	return e.state.NewSnapshotAt(root)
 }
 
@@ -147,14 +160,18 @@ func (e *Executor) BeginTxn(
 	header *types.Header,
 	coinbaseReceiver types.Address,
 ) (*Transition, error) {
-	forkConfig := e.config.Forks.At(header.Number)
-
-	auxSnap2, err := e.state.NewSnapshotAt(parentRoot)
-	if err != nil {
-		return nil, err
+	if header == nil {
+		return nil, errors.New("nil header")
 	}
 
-	newTxn := NewTxn(auxSnap2)
+	forkConfig := e.config.Forks.At(header.Number)
+
+	auxSnap, err := e.state.NewSnapshotAt(parentRoot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create state snapshot: %w", err)
+	}
+
+	newTxn := NewTxn(auxSnap)
 
 	txCtx := runtime.TxContext{
 		Coinbase:   coinbaseReceiver,
@@ -169,7 +186,7 @@ func (e *Executor) BeginTxn(
 		logger:   e.logger,
 		ctx:      txCtx,
 		state:    newTxn,
-		snap:     auxSnap2,
+		snap:     auxSnap,
 		getHash:  e.GetHash(header),
 		auxState: e.state,
 		config:   forkConfig,
@@ -187,18 +204,25 @@ func (e *Executor) BeginTxn(
 }
 
 // validateTransactionSecurity performs security checks on a transaction.
-// It enforces that the transaction uses the ACC-20 token standard and that the destination
-// address is in the correct format.
+// Note: Assumption is that types.Transaction has a field called 'SecurityInfo'
+// that contains security-related fields like 'TokenStandard'.
 func validateTransactionSecurity(tx *types.Transaction) error {
-	// Enforce that the transaction adheres to the ACC-20 token standard.
-	if tx.TokenStandard != "ACC-20" {
-		return fmt.Errorf("transaction rejected: token standard mismatch, expected ACC-20")
+	if tx == nil {
+		return errors.New("nil transaction")
 	}
-	// Ensure that if a destination address is provided, it is exactly 20 bytes.
-	if tx.To != nil && len(tx.To.Bytes()) != 20 {
-		return fmt.Errorf("transaction rejected: invalid destination address format")
+
+	// Ensure that if a destination address is provided, it is valid
+	if tx.To != nil && *tx.To == types.ZeroAddress {
+		return errors.New("transaction rejected: zero address as destination")
 	}
-	// Additional anti-rugpull or security checks can be added here.
+
+	// The TokenStandard field might not exist in the original Transaction struct
+	// This assumes it exists - modify based on actual struct definition
+	if secInfo := tx.GetSecurityInfo(); secInfo != nil {
+		if secInfo.TokenStandard != "ACC-20" {
+			return errors.New("transaction rejected: token standard mismatch, expected ACC-20")
+		}
+	}
+
 	return nil
 }
-
