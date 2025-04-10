@@ -26,7 +26,7 @@ func DefaultParams() *Params {
 		ChainID:       20030,                  // Mainnet chain ID
 		BlockTime:     200 * time.Millisecond, // 0.2 second blocks
 		GasLimit:      8000000,
-		MaxValidators: 21,
+		MaxValidators: 500000,
 		TokenStandard: "ACC-20", // Our token standard
 		Whitelists:    &Whitelists{},
 		Forks:         AllForksEnabled,
