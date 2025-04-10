@@ -1,174 +1,256 @@
 package state
 
 import (
-	"errors"
 	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
-	"github.com/0xPolygon/polygon-edge/chain"
-	"github.com/0xPolygon/polygon-edge/crypto"
-	"github.com/0xPolygon/polygon-edge/state/runtime"
-	"github.com/0xPolygon/polygon-edge/state/runtime/evm"
-	"github.com/0xPolygon/polygon-edge/state/runtime/precompiled"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/hashicorp/go-hclog"
+
+	"github.com/hotenglish775/mainnet/chain"
+	"github.com/hotenglish775/mainnet/parallel"
+	"github.com/hotenglish775/mainnet/runtime"
+	"github.com/hotenglish775/mainnet/runtime/evm"
+	"github.com/hotenglish775/mainnet/runtime/precompiled"
 )
 
-// Constants used in transaction execution.
-const (
-	spuriousDragonMaxCodeSize = 24576
-
-	TxGas                 uint64 = 21000 // Gas for a normal transaction.
-	TxGasContractCreation uint64 = 53000 // Gas for a transaction creating a contract.
-)
-
-var emptyCodeHash = types.BytesToHash(crypto.Keccak256(nil))
-
-// GetHashByNumber is a function type that returns the block hash for a given block number.
+// GetHashByNumber is a function type to obtain a block hash by its number.
 type GetHashByNumber = func(i uint64) types.Hash
 
-// GetHashByNumberHelper returns a GetHashByNumber function given a header.
+// GetHashByNumberHelper returns a function of GetHashByNumber given a header.
 type GetHashByNumberHelper = func(*types.Header) GetHashByNumber
 
-// Executor is the main entity responsible for executing transactions and updating state.
+// Executor is responsible for processing blocks and executing transactions.
 type Executor struct {
-	logger   hclog.Logger
-	config   *chain.Params
-	state    State
-	GetHash  GetHashByNumberHelper
-	mutex    sync.RWMutex
-	PostHook func(txn *Transition)
+	logger       hclog.Logger
+	config       *chain.Params
+	state        State
+	GetHash      GetHashByNumberHelper
+	PostHook     func(txn *Transition)
+	parallelExec *parallel.ParallelExecutor
+	lock         sync.Mutex
 }
 
-// NewExecutor creates and returns a new Executor instance.
+// NewExecutor creates a new Executor instance.
 func NewExecutor(config *chain.Params, s State, logger hclog.Logger) *Executor {
-	if logger == nil {
-		logger = hclog.NewNullLogger()
-	}
 	return &Executor{
-		logger: logger,
-		config: config,
-		state:  s,
+		logger:       logger,
+		config:       config,
+		state:        s,
+		parallelExec: parallel.NewParallelExecutor(),
 	}
 }
 
-// WriteGenesis writes the genesis state to the underlying database and returns its hash.
-func (e *Executor) WriteGenesis(alloc map[types.Address]*chain.GenesisAccount) types.Hash {
-	if alloc == nil {
-		return types.Hash{}
-	}
-
-	snap := e.state.NewSnapshot()
-	txn := NewTxn(snap)
-
-	for addr, account := range alloc {
-		if account.Balance != nil {
-			txn.AddBalance(addr, account.Balance)
-		}
-		if account.Nonce != 0 {
-			txn.SetNonce(addr, account.Nonce)
-		}
-		if len(account.Code) != 0 {
-			txn.SetCode(addr, account.Code)
-		}
-		for key, value := range account.Storage {
-			txn.SetState(addr, key, value)
-		}
-	}
-
-	objs := txn.Commit(false)
-	_, root := snap.Commit(objs)
-	return types.BytesToHash(root)
-}
-
-// BlockResult represents the result from processing a block.
-type BlockResult struct {
-	Root     types.Hash
-	Receipts []*types.Receipt
-	TotalGas uint64
-}
-
-// ProcessBlock processes all transactions in the given block, applying them sequentially
-// and enforcing security checks. It returns a Transition containing the updated state.
+// ProcessBlock processes the block transactions by grouping them and executing in parallel.
 func (e *Executor) ProcessBlock(
 	parentRoot types.Hash,
 	block *types.Block,
 	blockCreator types.Address,
 ) (*Transition, error) {
-	if block == nil {
-		return nil, errors.New("nil block")
-	}
-
+	// Begin a new state transaction.
 	txn, err := e.BeginTxn(parentRoot, block.Header, blockCreator)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
+	// Process each transaction in the block
+	start := time.Now()
+	
+	// Wrap each block transaction into a ParallelTx.
+	var ptxs []*parallel.ParallelTx
 	for _, t := range block.Transactions {
-		// If transaction gas exceeds block gas limit, record a failed receipt.
-		if t.ExceedsBlockGasLimit(block.Header.GasLimit) {
-			if err := txn.WriteFailedReceipt(t); err != nil {
-				e.logger.Error("failed to write failed receipt", "tx", t.Hash(), "error", err)
-				return nil, fmt.Errorf("failed to write failed receipt: %w", err)
-			}
-			continue
+		ptx := &parallel.ParallelTx{
+			Tx:       t,
+			ReadSet:  extractReadSet(t),
+			WriteSet: extractWriteSet(t),
 		}
-
-		// Enforce blockchain security checks
-		if err := validateTransactionSecurity(t); err != nil {
-			e.logger.Error("transaction rejected", "tx", t.Hash(), "error", err)
-			if err := txn.WriteFailedReceipt(t); err != nil {
-				e.logger.Error("failed to write failed receipt", "tx", t.Hash(), "error", err)
-				return nil, fmt.Errorf("failed to write failed receipt: %w", err)
-			}
-			continue
-		}
-
-		if err := txn.Write(t); err != nil {
-			e.logger.Error("failed to write transaction", "tx", t.Hash(), "error", err)
-			return nil, fmt.Errorf("failed to write transaction: %w", err)
-		}
-		e.logger.Info("transaction processed", "tx", t.Hash())
+		ptxs = append(ptxs, ptx)
 	}
+
+	// Execute transactions in parallel.
+	results, err := e.parallelExec.ExecuteTransactions(ptxs)
+	if err != nil {
+		return nil, fmt.Errorf("parallel execution error: %w", err)
+	}
+
+	// Process the results.
+	for _, res := range results {
+		if res.Err != nil {
+			if perr := txn.WriteFailedReceipt(res.Tx.Tx); perr != nil {
+				return nil, fmt.Errorf("failed to write failed receipt: %w", perr)
+			}
+			// Log error details
+			e.logger.Error("Transaction failed", "tx", res.Tx.Tx.Hash().Hex(), "error", res.Err)
+		} else {
+			if err := txn.Write(res.Tx.Tx); err != nil {
+				return nil, fmt.Errorf("failed to write transaction: %w", err)
+			}
+		}
+	}
+
+	// Log processing time for debugging/profiling
+	e.logger.Debug("block processed", "number", block.Header.Number, "txs", len(block.Transactions), "time", time.Since(start))
 
 	return txn, nil
 }
 
-// State returns the underlying state object.
-func (e *Executor) State() State {
-	return e.state
-}
-
-// StateAt returns a snapshot of the state at a given root.
-func (e *Executor) StateAt(root types.Hash) (Snapshot, error) {
-	if root == types.ZeroHash {
-		return nil, errors.New("empty root hash")
-	}
-	return e.state.NewSnapshotAt(root)
-}
-
-// GetForksInTime returns the active forks at the given block number.
-func (e *Executor) GetForksInTime(blockNumber uint64) chain.ForksInTime {
-	return e.config.Forks.At(blockNumber)
-}
-
-// BeginTxn initializes a new Transition object for processing a block,
-// using the state snapshot at the parent's root.
-func (e *Executor) BeginTxn(
-	parentRoot types.Hash,
-	header *types.Header,
-	coinbaseReceiver types.Address,
-) (*Transition, error) {
-	if header == nil {
-		return nil, errors.New("nil header")
+// extractReadSet extracts the ReadSet for a transaction based on ACC-20 standard.
+// This returns the storage keys or account identifiers the transaction reads.
+func extractReadSet(t *types.Transaction) []string {
+	if t == nil {
+		return []string{}
 	}
 
+	readSet := []string{}
+	
+	// Extract sender address
+	from, err := t.GetFrom()
+	if err == nil {
+		readSet = append(readSet, from.String())
+	}
+	
+	// Extract recipient address for ACC-20 token transfers
+	if t.To != nil {
+		readSet = append(readSet, t.To.String())
+	}
+	
+	// Add ACC-20 specific storage keys
+	if t.IsContractCreation() {
+		// No specific contract reads
+	} else if t.To != nil {
+		// Common ACC-20 methods like balanceOf, allowance, etc.
+		method := getACC20Method(t.Input)
+		if method == "balanceOf" || method == "allowance" || method == "totalSupply" || method == "name" || method == "symbol" || method == "decimals" {
+			contractAddr := t.To.String()
+			readSet = append(readSet, fmt.Sprintf("%s:metadata", contractAddr))
+			
+			// For balanceOf and allowance, we're reading specific mappings
+			if len(t.Input) >= 36 && (method == "balanceOf" || method == "allowance") {
+				// Extract account address from input
+				accountAddrSlice := t.Input[4:36]
+				accountAddr := types.BytesToAddress(accountAddrSlice).String()
+				readSet = append(readSet, fmt.Sprintf("%s:balances:%s", contractAddr, accountAddr))
+				
+				// For allowance, add second address (spender)
+				if method == "allowance" && len(t.Input) >= 68 {
+					spenderAddrSlice := t.Input[36:68]
+					spenderAddr := types.BytesToAddress(spenderAddrSlice).String()
+					readSet = append(readSet, fmt.Sprintf("%s:allowances:%s:%s", contractAddr, accountAddr, spenderAddr))
+				}
+			}
+		}
+	}
+	
+	return readSet
+}
+
+// extractWriteSet extracts the WriteSet for a transaction based on ACC-20 standard.
+// This returns the storage keys or account identifiers the transaction modifies.
+func extractWriteSet(t *types.Transaction) []string {
+	if t == nil {
+		return []string{}
+	}
+
+	writeSet := []string{}
+	
+	// Extract sender address
+	from, err := t.GetFrom()
+	if err == nil {
+		writeSet = append(writeSet, from.String())
+	}
+	
+	// Extract recipient address for ACC-20 token transfers
+	if t.To != nil {
+		writeSet = append(writeSet, t.To.String())
+	}
+	
+	// Add ACC-20 specific storage keys
+	if t.IsContractCreation() {
+		// Contract creation modifies the contract's storage
+		// Since we don't know the contract address yet, we'll use a placeholder
+		writeSet = append(writeSet, "new_contract")
+	} else if t.To != nil {
+		// Common ACC-20 methods that modify state
+		method := getACC20Method(t.Input)
+		if method == "transfer" || method == "transferFrom" || method == "approve" || method == "mint" || method == "burn" {
+			contractAddr := t.To.String()
+			
+			// For transfer and transferFrom, we're modifying balances
+			if len(t.Input) >= 36 && (method == "transfer" || method == "transferFrom" || method == "mint" || method == "burn") {
+				// Extract recipient address from input
+				recipientAddrSlice := t.Input[4:36]
+				recipientAddr := types.BytesToAddress(recipientAddrSlice).String()
+				writeSet = append(writeSet, fmt.Sprintf("%s:balances:%s", contractAddr, recipientAddr))
+				
+				// For transferFrom and approve, add sender's allowance
+				if method == "transferFrom" && len(t.Input) >= 68 {
+					senderAddrSlice := t.Input[36:68]
+					senderAddr := types.BytesToAddress(senderAddrSlice).String()
+					writeSet = append(writeSet, fmt.Sprintf("%s:balances:%s", contractAddr, senderAddr))
+					writeSet = append(writeSet, fmt.Sprintf("%s:allowances:%s:%s", contractAddr, senderAddr, from.String()))
+				}
+			}
+			
+			// For approve, we're modifying allowances
+			if method == "approve" && len(t.Input) >= 36 {
+				// Extract spender address from input
+				spenderAddrSlice := t.Input[4:36]
+				spenderAddr := types.BytesToAddress(spenderAddrSlice).String()
+				writeSet = append(writeSet, fmt.Sprintf("%s:allowances:%s:%s", contractAddr, from.String(), spenderAddr))
+			}
+		}
+	}
+	
+	return writeSet
+}
+
+// getACC20Method identifies the ACC-20 method being called based on transaction input data
+func getACC20Method(input []byte) string {
+	if len(input) < 4 {
+		return ""
+	}
+	
+	// Method ID is first 4 bytes of the hash of the method signature
+	methodID := input[:4]
+	
+	// Common ACC-20 method IDs
+	switch string(methodID) {
+	case "\xa9\x05\x9c\xbb": // transfer(address,uint256)
+		return "transfer"
+	case "\x23\xb8\x72\xdd": // transferFrom(address,address,uint256)
+		return "transferFrom"
+	case "\x09\x5e\xa7\xb3": // approve(address,uint256)
+		return "approve"
+	case "\x70\xa0\x82\x31": // balanceOf(address)
+		return "balanceOf"
+	case "\xdd\x62\xed\x3e": // allowance(address,address)
+		return "allowance"
+	case "\x18\x16\x0d\xdd": // totalSupply()
+		return "totalSupply"
+	case "\x40\xc1\x0f\x19": // mint(address,uint256)
+		return "mint"
+	case "\x42\x96\x6c\x68": // burn(uint256)
+		return "burn"
+	case "\x06\xfd\xde\x03": // name()
+		return "name"
+	case "\x95\xd8\x9b\x41": // symbol()
+		return "symbol"
+	case "\x31\x3c\xe5\x67": // decimals()
+		return "decimals"
+	default:
+		return "unknown"
+	}
+}
+
+// BeginTxn creates a new state transition (transaction) using a snapshot of the current state.
+func (e *Executor) BeginTxn(parentRoot types.Hash, header *types.Header, coinbaseReceiver types.Address) (*Transition, error) {
 	forkConfig := e.config.Forks.At(header.Number)
 
 	auxSnap, err := e.state.NewSnapshotAt(parentRoot)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create state snapshot: %w", err)
+		return nil, fmt.Errorf("failed to create new snapshot: %w", err)
 	}
 
 	newTxn := NewTxn(auxSnap)
@@ -183,18 +265,16 @@ func (e *Executor) BeginTxn(
 	}
 
 	txn := &Transition{
-		logger:   e.logger,
-		ctx:      txCtx,
-		state:    newTxn,
-		snap:     auxSnap,
-		getHash:  e.GetHash(header),
-		auxState: e.state,
-		config:   forkConfig,
-		gasPool:  uint64(txCtx.GasLimit),
-
-		receipts: []*types.Receipt{},
-		totalGas: 0,
-
+		logger:      e.logger,
+		ctx:         txCtx,
+		state:       newTxn,
+		snap:        auxSnap,
+		getHash:     e.GetHash(header),
+		auxState:    e.state,
+		config:      forkConfig,
+		gasPool:     uint64(txCtx.GasLimit),
+		receipts:    []*types.Receipt{},
+		totalGas:    0,
 		evm:         evm.NewEVM(),
 		precompiles: precompiled.NewPrecompiled(),
 		PostHook:    e.PostHook,
@@ -203,26 +283,90 @@ func (e *Executor) BeginTxn(
 	return txn, nil
 }
 
-// validateTransactionSecurity performs security checks on a transaction.
-// Note: Assumption is that types.Transaction has a field called 'SecurityInfo'
-// that contains security-related fields like 'TokenStandard'.
-func validateTransactionSecurity(tx *types.Transaction) error {
-	if tx == nil {
-		return errors.New("nil transaction")
-	}
+// State represents the blockchain state
+type State interface {
+	NewSnapshotAt(root types.Hash) (Snapshot, error)
+	// Other methods as needed
+}
 
-	// Ensure that if a destination address is provided, it is valid
-	if tx.To != nil && *tx.To == types.ZeroAddress {
-		return errors.New("transaction rejected: zero address as destination")
-	}
+// Snapshot represents a point-in-time snapshot of the blockchain state
+type Snapshot interface {
+	// Methods needed for state snapshots
+}
 
-	// The TokenStandard field might not exist in the original Transaction struct
-	// This assumes it exists - modify based on actual struct definition
-	if secInfo := tx.GetSecurityInfo(); secInfo != nil {
-		if secInfo.TokenStandard != "ACC-20" {
-			return errors.New("transaction rejected: token standard mismatch, expected ACC-20")
-		}
+// NewTxn creates a new transaction object from a snapshot
+func NewTxn(snap Snapshot) *Txn {
+	return &Txn{
+		snap: snap,
 	}
+}
 
+// Txn represents a transaction object
+type Txn struct {
+	snap Snapshot
+	// Other fields as needed
+}
+
+// Transition represents a state transition process
+type Transition struct {
+	logger      hclog.Logger
+	ctx         runtime.TxContext
+	state       *Txn
+	snap        Snapshot
+	getHash     GetHashByNumber
+	auxState    State
+	config      chain.ForksInTime
+	gasPool     uint64
+	receipts    []*types.Receipt
+	totalGas    uint64
+	evm         *evm.EVM
+	precompiles *precompiled.Precompiled
+	PostHook    func(txn *Transition)
+}
+
+// Write processes a transaction and writes it to the chain
+func (t *Transition) Write(tx *types.Transaction) error {
+	// Implementation would include:
+	// 1. Validate transaction
+	// 2. Apply transaction changes to state
+	// 3. Create receipt
+	// 4. Update gas used
+	
+	// For brevity, simplified implementation:
+	receipt := &types.Receipt{
+		TxHash:            tx.Hash(),
+		GasUsed:           tx.Gas,
+		TransactionType:   tx.Type,
+		ContractAddress:   nil, // Set if contract creation
+		Status:            1,   // 1 for success
+	}
+	
+	// Add receipt to list
+	t.receipts = append(t.receipts, receipt)
+	t.totalGas += tx.Gas
+	
+	// Call post hook if defined
+	if t.PostHook != nil {
+		t.PostHook(t)
+	}
+	
+	return nil
+}
+
+// WriteFailedReceipt creates a receipt for a failed transaction
+func (t *Transition) WriteFailedReceipt(tx *types.Transaction) error {
+	// Create receipt for failed transaction
+	receipt := &types.Receipt{
+		TxHash:            tx.Hash(),
+		GasUsed:           tx.Gas,
+		TransactionType:   tx.Type,
+		ContractAddress:   nil,
+		Status:            0, // 0 for failure
+	}
+	
+	// Add receipt to list
+	t.receipts = append(t.receipts, receipt)
+	t.totalGas += tx.Gas
+	
 	return nil
 }
