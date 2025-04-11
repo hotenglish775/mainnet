@@ -11,18 +11,18 @@ import (
 
 	"github.com/hotenglish775/mainnet/chain"
 	"github.com/hotenglish775/mainnet/parallel"
-	"github.com/hotenglish775/mainnet/runtime"
-	"github.com/hotenglish775/mainnet/runtime/evm"
-	"github.com/hotenglish775/mainnet/runtime/precompiled"
+	"github.com/hotenglish775/mainnet/state/runtime"
+	"github.com/hotenglish775/mainnet/state/runtime/evm"
+	"github.com/hotenglish775/mainnet/state/runtime/precompiled"
 )
 
-// GetHashByNumber is a function type to obtain a block hash by its number.
+// GetHashByNumber defines a function to get a block hash by its number.
 type GetHashByNumber = func(i uint64) types.Hash
 
-// GetHashByNumberHelper returns a function of GetHashByNumber given a header.
+// GetHashByNumberHelper returns a GetHashByNumber function for a header.
 type GetHashByNumberHelper = func(*types.Header) GetHashByNumber
 
-// Executor is responsible for processing blocks and executing transactions.
+// Executor processes blocks and applies transactions to state.
 type Executor struct {
 	logger       hclog.Logger
 	config       *chain.Params
@@ -30,37 +30,59 @@ type Executor struct {
 	GetHash      GetHashByNumberHelper
 	PostHook     func(txn *Transition)
 	parallelExec *parallel.ParallelExecutor
-	lock         sync.Mutex
 }
 
 // NewExecutor creates a new Executor instance.
 func NewExecutor(config *chain.Params, s State, logger hclog.Logger) *Executor {
+	if config == nil {
+		panic("config cannot be nil")
+	}
+	if s == nil {
+		panic("state cannot be nil")
+	}
+	
 	return &Executor{
-		logger:       logger,
+		logger:       logger.Named("executor"),
 		config:       config,
 		state:        s,
 		parallelExec: parallel.NewParallelExecutor(),
 	}
 }
 
-// ProcessBlock processes the block transactions by grouping them and executing in parallel.
+// ProcessBlock processes the transactions in a block by grouping them and executing in parallel.
 func (e *Executor) ProcessBlock(
 	parentRoot types.Hash,
 	block *types.Block,
 	blockCreator types.Address,
 ) (*Transition, error) {
-	// Begin a new state transaction.
+	if block == nil {
+		return nil, fmt.Errorf("block cannot be nil")
+	}
+	
+	startTime := time.Now()
+	defer func() {
+		e.logger.Debug("block processing completed", 
+			"number", block.Header.Number, 
+			"hash", block.Header.Hash, 
+			"txs", len(block.Transactions),
+			"time", time.Since(startTime))
+	}()
+	
 	txn, err := e.BeginTxn(parentRoot, block.Header, blockCreator)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	// Process each transaction in the block
-	start := time.Now()
-	
-	// Wrap each block transaction into a ParallelTx.
-	var ptxs []*parallel.ParallelTx
+	if len(block.Transactions) == 0 {
+		return txn, nil
+	}
+
+	ptxs := make([]*parallel.ParallelTx, 0, len(block.Transactions))
 	for _, t := range block.Transactions {
+		if t == nil {
+			continue
+		}
+		
 		ptx := &parallel.ParallelTx{
 			Tx:       t,
 			ReadSet:  extractReadSet(t),
@@ -69,20 +91,24 @@ func (e *Executor) ProcessBlock(
 		ptxs = append(ptxs, ptx)
 	}
 
-	// Execute transactions in parallel.
 	results, err := e.parallelExec.ExecuteTransactions(ptxs)
 	if err != nil {
 		return nil, fmt.Errorf("parallel execution error: %w", err)
 	}
 
-	// Process the results.
 	for _, res := range results {
+		if res == nil || res.Tx == nil || res.Tx.Tx == nil {
+			e.logger.Warn("skipping nil execution result")
+			continue
+		}
+		
 		if res.Err != nil {
 			if perr := txn.WriteFailedReceipt(res.Tx.Tx); perr != nil {
 				return nil, fmt.Errorf("failed to write failed receipt: %w", perr)
 			}
-			// Log error details
-			e.logger.Error("Transaction failed", "tx", res.Tx.Tx.Hash().Hex(), "error", res.Err)
+			e.logger.Error("transaction failed", 
+				"tx", res.Tx.Tx.Hash().Hex(), 
+				"error", res.Err)
 		} else {
 			if err := txn.Write(res.Tx.Tx); err != nil {
 				return nil, fmt.Errorf("failed to write transaction: %w", err)
@@ -90,55 +116,49 @@ func (e *Executor) ProcessBlock(
 		}
 	}
 
-	// Log processing time for debugging/profiling
-	e.logger.Debug("block processed", "number", block.Header.Number, "txs", len(block.Transactions), "time", time.Since(start))
-
 	return txn, nil
 }
 
-// extractReadSet extracts the ReadSet for a transaction based on ACC-20 standard.
-// This returns the storage keys or account identifiers the transaction reads.
+// extractReadSet extracts the state keys the transaction will read.
 func extractReadSet(t *types.Transaction) []string {
 	if t == nil {
 		return []string{}
 	}
-
-	readSet := []string{}
 	
-	// Extract sender address
-	from, err := t.GetFrom()
-	if err == nil {
-		readSet = append(readSet, from.String())
-	}
+	// Extract read set from transaction data
+	// Parse ACC-20 method calls to determine which state keys will be read
+	readSet := make([]string, 0)
 	
-	// Extract recipient address for ACC-20 token transfers
+	// Add sender address as it's always read for nonce and balance checks
+	sender, _ := t.GetSender()
+	readSet = append(readSet, sender.String())
+	
+	// Add recipient address if it's a value transfer or contract call
 	if t.To != nil {
 		readSet = append(readSet, t.To.String())
 	}
 	
-	// Add ACC-20 specific storage keys
-	if t.IsContractCreation() {
-		// No specific contract reads
-	} else if t.To != nil {
-		// Common ACC-20 methods like balanceOf, allowance, etc.
-		method := getACC20Method(t.Input)
-		if method == "balanceOf" || method == "allowance" || method == "totalSupply" || method == "name" || method == "symbol" || method == "decimals" {
-			contractAddr := t.To.String()
-			readSet = append(readSet, fmt.Sprintf("%s:metadata", contractAddr))
-			
-			// For balanceOf and allowance, we're reading specific mappings
-			if len(t.Input) >= 36 && (method == "balanceOf" || method == "allowance") {
-				// Extract account address from input
-				accountAddrSlice := t.Input[4:36]
-				accountAddr := types.BytesToAddress(accountAddrSlice).String()
-				readSet = append(readSet, fmt.Sprintf("%s:balances:%s", contractAddr, accountAddr))
-				
-				// For allowance, add second address (spender)
-				if method == "allowance" && len(t.Input) >= 68 {
-					spenderAddrSlice := t.Input[36:68]
-					spenderAddr := types.BytesToAddress(spenderAddrSlice).String()
-					readSet = append(readSet, fmt.Sprintf("%s:allowances:%s:%s", contractAddr, accountAddr, spenderAddr))
-				}
+	// Parse the transaction input for ACC-20 methods that read state
+	if t.Input != nil && len(t.Input) >= 4 {
+		methodID := t.Input[:4]
+		
+		// Common ACC-20 method IDs that read state:
+		// balanceOf, allowance, totalSupply, etc.
+		switch {
+		case isBalanceOfMethod(methodID):
+			if len(t.Input) >= 36 {
+				account := extractAddressFromInput(t.Input, 4)
+				readSet = append(readSet, fmt.Sprintf("acc20:balance:%s", account))
+			}
+		case isAllowanceMethod(methodID):
+			if len(t.Input) >= 68 {
+				owner := extractAddressFromInput(t.Input, 4)
+				spender := extractAddressFromInput(t.Input, 36)
+				readSet = append(readSet, fmt.Sprintf("acc20:allowance:%s:%s", owner, spender))
+			}
+		case isTotalSupplyMethod(methodID):
+			if t.To != nil {
+				readSet = append(readSet, fmt.Sprintf("acc20:supply:%s", t.To.String()))
 			}
 		}
 	}
@@ -146,59 +166,62 @@ func extractReadSet(t *types.Transaction) []string {
 	return readSet
 }
 
-// extractWriteSet extracts the WriteSet for a transaction based on ACC-20 standard.
-// This returns the storage keys or account identifiers the transaction modifies.
+// extractWriteSet extracts the state keys the transaction will write.
 func extractWriteSet(t *types.Transaction) []string {
 	if t == nil {
 		return []string{}
 	}
-
-	writeSet := []string{}
 	
-	// Extract sender address
-	from, err := t.GetFrom()
-	if err == nil {
-		writeSet = append(writeSet, from.String())
-	}
+	// Extract write set from transaction data
+	// Parse ACC-20 method calls to determine which state keys will be written
+	writeSet := make([]string, 0)
 	
-	// Extract recipient address for ACC-20 token transfers
-	if t.To != nil {
+	// Add sender address as it's always written (nonce update)
+	sender, _ := t.GetSender()
+	writeSet = append(writeSet, sender.String())
+	
+	// Add recipient address if it's a value transfer
+	if t.To != nil && t.Value.Sign() > 0 {
 		writeSet = append(writeSet, t.To.String())
 	}
 	
-	// Add ACC-20 specific storage keys
-	if t.IsContractCreation() {
-		// Contract creation modifies the contract's storage
-		// Since we don't know the contract address yet, we'll use a placeholder
-		writeSet = append(writeSet, "new_contract")
-	} else if t.To != nil {
-		// Common ACC-20 methods that modify state
-		method := getACC20Method(t.Input)
-		if method == "transfer" || method == "transferFrom" || method == "approve" || method == "mint" || method == "burn" {
-			contractAddr := t.To.String()
-			
-			// For transfer and transferFrom, we're modifying balances
-			if len(t.Input) >= 36 && (method == "transfer" || method == "transferFrom" || method == "mint" || method == "burn") {
-				// Extract recipient address from input
-				recipientAddrSlice := t.Input[4:36]
-				recipientAddr := types.BytesToAddress(recipientAddrSlice).String()
-				writeSet = append(writeSet, fmt.Sprintf("%s:balances:%s", contractAddr, recipientAddr))
-				
-				// For transferFrom and approve, add sender's allowance
-				if method == "transferFrom" && len(t.Input) >= 68 {
-					senderAddrSlice := t.Input[36:68]
-					senderAddr := types.BytesToAddress(senderAddrSlice).String()
-					writeSet = append(writeSet, fmt.Sprintf("%s:balances:%s", contractAddr, senderAddr))
-					writeSet = append(writeSet, fmt.Sprintf("%s:allowances:%s:%s", contractAddr, senderAddr, from.String()))
-				}
+	// Parse the transaction input for ACC-20 methods that write state
+	if t.Input != nil && len(t.Input) >= 4 {
+		methodID := t.Input[:4]
+		
+		// Common ACC-20 method IDs that write state:
+		// transfer, approve, transferFrom, etc.
+		switch {
+		case isTransferMethod(methodID):
+			if len(t.Input) >= 36 {
+				to := extractAddressFromInput(t.Input, 4)
+				writeSet = append(writeSet, fmt.Sprintf("acc20:balance:%s", sender.String()))
+				writeSet = append(writeSet, fmt.Sprintf("acc20:balance:%s", to))
 			}
-			
-			// For approve, we're modifying allowances
-			if method == "approve" && len(t.Input) >= 36 {
-				// Extract spender address from input
-				spenderAddrSlice := t.Input[4:36]
-				spenderAddr := types.BytesToAddress(spenderAddrSlice).String()
-				writeSet = append(writeSet, fmt.Sprintf("%s:allowances:%s:%s", contractAddr, from.String(), spenderAddr))
+		case isApproveMethod(methodID):
+			if len(t.Input) >= 36 {
+				spender := extractAddressFromInput(t.Input, 4)
+				writeSet = append(writeSet, fmt.Sprintf("acc20:allowance:%s:%s", sender.String(), spender))
+			}
+		case isTransferFromMethod(methodID):
+			if len(t.Input) >= 68 {
+				from := extractAddressFromInput(t.Input, 4)
+				to := extractAddressFromInput(t.Input, 36)
+				writeSet = append(writeSet, fmt.Sprintf("acc20:balance:%s", from))
+				writeSet = append(writeSet, fmt.Sprintf("acc20:balance:%s", to))
+				writeSet = append(writeSet, fmt.Sprintf("acc20:allowance:%s:%s", from, sender.String()))
+			}
+		case isMintMethod(methodID):
+			if t.To != nil && len(t.Input) >= 36 {
+				to := extractAddressFromInput(t.Input, 4)
+				writeSet = append(writeSet, fmt.Sprintf("acc20:balance:%s", to))
+				writeSet = append(writeSet, fmt.Sprintf("acc20:supply:%s", t.To.String()))
+			}
+		case isBurnMethod(methodID):
+			if t.To != nil && len(t.Input) >= 36 {
+				account := extractAddressFromInput(t.Input, 4)
+				writeSet = append(writeSet, fmt.Sprintf("acc20:balance:%s", account))
+				writeSet = append(writeSet, fmt.Sprintf("acc20:supply:%s", t.To.String()))
 			}
 		}
 	}
@@ -206,51 +229,72 @@ func extractWriteSet(t *types.Transaction) []string {
 	return writeSet
 }
 
-// getACC20Method identifies the ACC-20 method being called based on transaction input data
-func getACC20Method(input []byte) string {
-	if len(input) < 4 {
+// Helper functions for extracting data from transaction input
+func extractAddressFromInput(input []byte, offset int) string {
+	if len(input) < offset+32 {
 		return ""
 	}
-	
-	// Method ID is first 4 bytes of the hash of the method signature
-	methodID := input[:4]
-	
-	// Common ACC-20 method IDs
-	switch string(methodID) {
-	case "\xa9\x05\x9c\xbb": // transfer(address,uint256)
-		return "transfer"
-	case "\x23\xb8\x72\xdd": // transferFrom(address,address,uint256)
-		return "transferFrom"
-	case "\x09\x5e\xa7\xb3": // approve(address,uint256)
-		return "approve"
-	case "\x70\xa0\x82\x31": // balanceOf(address)
-		return "balanceOf"
-	case "\xdd\x62\xed\x3e": // allowance(address,address)
-		return "allowance"
-	case "\x18\x16\x0d\xdd": // totalSupply()
-		return "totalSupply"
-	case "\x40\xc1\x0f\x19": // mint(address,uint256)
-		return "mint"
-	case "\x42\x96\x6c\x68": // burn(uint256)
-		return "burn"
-	case "\x06\xfd\xde\x03": // name()
-		return "name"
-	case "\x95\xd8\x9b\x41": // symbol()
-		return "symbol"
-	case "\x31\x3c\xe5\x67": // decimals()
-		return "decimals"
-	default:
-		return "unknown"
-	}
+	// Extract 20-byte address from 32-byte parameter
+	addrBytes := input[offset+12 : offset+32]
+	return fmt.Sprintf("0x%x", addrBytes)
 }
 
-// BeginTxn creates a new state transition (transaction) using a snapshot of the current state.
-func (e *Executor) BeginTxn(parentRoot types.Hash, header *types.Header, coinbaseReceiver types.Address) (*Transition, error) {
+// Helper functions to identify ACC-20 method signatures
+func isTransferMethod(methodID []byte) bool {
+	// Transfer method signature: 0xa9059cbb
+	return methodID[0] == 0xa9 && methodID[1] == 0x05 && methodID[2] == 0x9c && methodID[3] == 0xbb
+}
+
+func isApproveMethod(methodID []byte) bool {
+	// Approve method signature: 0x095ea7b3
+	return methodID[0] == 0x09 && methodID[1] == 0x5e && methodID[2] == 0xa7 && methodID[3] == 0xb3
+}
+
+func isTransferFromMethod(methodID []byte) bool {
+	// TransferFrom method signature: 0x23b872dd
+	return methodID[0] == 0x23 && methodID[1] == 0xb8 && methodID[2] == 0x72 && methodID[3] == 0xdd
+}
+
+func isBalanceOfMethod(methodID []byte) bool {
+	// BalanceOf method signature: 0x70a08231
+	return methodID[0] == 0x70 && methodID[1] == 0xa0 && methodID[2] == 0x82 && methodID[3] == 0x31
+}
+
+func isAllowanceMethod(methodID []byte) bool {
+	// Allowance method signature: 0xdd62ed3e
+	return methodID[0] == 0xdd && methodID[1] == 0x62 && methodID[2] == 0xed && methodID[3] == 0x3e
+}
+
+func isTotalSupplyMethod(methodID []byte) bool {
+	// TotalSupply method signature: 0x18160ddd
+	return methodID[0] == 0x18 && methodID[1] == 0x16 && methodID[2] == 0x0d && methodID[3] == 0xdd
+}
+
+func isMintMethod(methodID []byte) bool {
+	// Mint method signature: 0x40c10f19
+	return methodID[0] == 0x40 && methodID[1] == 0xc1 && methodID[2] == 0x0f && methodID[3] == 0x19
+}
+
+func isBurnMethod(methodID []byte) bool {
+	// Burn method signature: 0x42966c68
+	return methodID[0] == 0x42 && methodID[1] == 0x96 && methodID[2] == 0x6c && methodID[3] == 0x68
+}
+
+// BeginTxn initializes a new Transition using a state snapshot.
+func (e *Executor) BeginTxn(
+	parentRoot types.Hash,
+	header *types.Header,
+	coinbaseReceiver types.Address,
+) (*Transition, error) {
+	if header == nil {
+		return nil, fmt.Errorf("header cannot be nil")
+	}
+
 	forkConfig := e.config.Forks.At(header.Number)
 
 	auxSnap, err := e.state.NewSnapshotAt(parentRoot)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create new snapshot: %w", err)
+		return nil, fmt.Errorf("failed to create state snapshot: %w", err)
 	}
 
 	newTxn := NewTxn(auxSnap)
@@ -265,7 +309,7 @@ func (e *Executor) BeginTxn(parentRoot types.Hash, header *types.Header, coinbas
 	}
 
 	txn := &Transition{
-		logger:      e.logger,
+		logger:      e.logger.Named("transition"),
 		ctx:         txCtx,
 		state:       newTxn,
 		snap:        auxSnap,
@@ -273,7 +317,7 @@ func (e *Executor) BeginTxn(parentRoot types.Hash, header *types.Header, coinbas
 		auxState:    e.state,
 		config:      forkConfig,
 		gasPool:     uint64(txCtx.GasLimit),
-		receipts:    []*types.Receipt{},
+		receipts:    make([]*types.Receipt, 0),
 		totalGas:    0,
 		evm:         evm.NewEVM(),
 		precompiles: precompiled.NewPrecompiled(),
@@ -281,92 +325,4 @@ func (e *Executor) BeginTxn(parentRoot types.Hash, header *types.Header, coinbas
 	}
 
 	return txn, nil
-}
-
-// State represents the blockchain state
-type State interface {
-	NewSnapshotAt(root types.Hash) (Snapshot, error)
-	// Other methods as needed
-}
-
-// Snapshot represents a point-in-time snapshot of the blockchain state
-type Snapshot interface {
-	// Methods needed for state snapshots
-}
-
-// NewTxn creates a new transaction object from a snapshot
-func NewTxn(snap Snapshot) *Txn {
-	return &Txn{
-		snap: snap,
-	}
-}
-
-// Txn represents a transaction object
-type Txn struct {
-	snap Snapshot
-	// Other fields as needed
-}
-
-// Transition represents a state transition process
-type Transition struct {
-	logger      hclog.Logger
-	ctx         runtime.TxContext
-	state       *Txn
-	snap        Snapshot
-	getHash     GetHashByNumber
-	auxState    State
-	config      chain.ForksInTime
-	gasPool     uint64
-	receipts    []*types.Receipt
-	totalGas    uint64
-	evm         *evm.EVM
-	precompiles *precompiled.Precompiled
-	PostHook    func(txn *Transition)
-}
-
-// Write processes a transaction and writes it to the chain
-func (t *Transition) Write(tx *types.Transaction) error {
-	// Implementation would include:
-	// 1. Validate transaction
-	// 2. Apply transaction changes to state
-	// 3. Create receipt
-	// 4. Update gas used
-	
-	// For brevity, simplified implementation:
-	receipt := &types.Receipt{
-		TxHash:            tx.Hash(),
-		GasUsed:           tx.Gas,
-		TransactionType:   tx.Type,
-		ContractAddress:   nil, // Set if contract creation
-		Status:            1,   // 1 for success
-	}
-	
-	// Add receipt to list
-	t.receipts = append(t.receipts, receipt)
-	t.totalGas += tx.Gas
-	
-	// Call post hook if defined
-	if t.PostHook != nil {
-		t.PostHook(t)
-	}
-	
-	return nil
-}
-
-// WriteFailedReceipt creates a receipt for a failed transaction
-func (t *Transition) WriteFailedReceipt(tx *types.Transaction) error {
-	// Create receipt for failed transaction
-	receipt := &types.Receipt{
-		TxHash:            tx.Hash(),
-		GasUsed:           tx.Gas,
-		TransactionType:   tx.Type,
-		ContractAddress:   nil,
-		Status:            0, // 0 for failure
-	}
-	
-	// Add receipt to list
-	t.receipts = append(t.receipts, receipt)
-	t.totalGas += tx.Gas
-	
-	return nil
 }
