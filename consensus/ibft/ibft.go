@@ -2,7 +2,6 @@ package ibft
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"math/big"
@@ -13,7 +12,6 @@ import (
 	"github.com/hashicorp/go-hclog"
 
 	"github.com/hotenglish775/mainnet/chain"
-	"github.com/hotenglish775/mainnet/crypto"
 	"github.com/hotenglish775/mainnet/validators"
 )
 
@@ -24,16 +22,13 @@ var (
 	ErrNegativeNumber     = errors.New("header number cannot be negative")
 	ErrNoHeaders          = errors.New("no headers provided")
 	ErrInvalidProposal    = errors.New("invalid proposal message")
-	ErrRoundTimeout       = errors.New("round timed out without quorum")
-	ErrInvalidCommit      = errors.New("invalid commit message")
-	ErrInvalidSignature   = errors.New("invalid signature")
 )
 
 // Message Types for IBFT consensus.
 type ProposalMsg struct {
-	Round     uint64
-	Block     *types.Block
-	Proposer  types.Address
+	Round    uint64
+	Block    *types.Block
+	Proposer types.Address
 	Signature []byte // Cryptographic signature of the proposer.
 }
 
@@ -59,40 +54,35 @@ type RoundChangeMsg struct {
 
 // IBFT represents the enhanced IBFT-based PoS consensus engine with messaging.
 type IBFT struct {
-	logger       hclog.Logger              // Logger for detailed logs.
-	config       *chain.Params             // Chain configuration parameters.
-	validatorSet *validators.ValidatorSet  // Active validator set.
-	currentRound uint64                    // Current consensus round.
-	privateKey   *ecdsa.PrivateKey         // Node's private key for signing
+	logger       hclog.Logger            // Logger for detailed logs.
+	config       *chain.Params           // Chain configuration parameters.
+	validatorSet *validators.ValidatorSet // Active validator set.
+	currentRound uint64                  // Current consensus round.
 
 	// Messaging data structures.
-	mu           sync.RWMutex
-	ctx          context.Context // Global context.
-	cancel       context.CancelFunc
-	roundTimeout time.Duration // Timeout duration for each round.
+	mu              sync.RWMutex
+	ctx             context.Context // Global context.
+	cancel          context.CancelFunc
+	roundTimeout    time.Duration   // Timeout duration for each round.
 
 	// Consensus state tracking.
-	height     uint64        // Current block height.
+	height     uint64       // Current block height.
 	lastBlock  *types.Header // Most recently finalized block.
 	isProposer bool          // Flag indicating if this node is the proposer in current round.
 
 	// In-memory message pools.
-	proposalMsgs    map[uint64]*ProposalMsg                       // Map by round.
-	prepareMsgs     map[uint64]map[types.Address]*PrepareMsg      // Per round, keyed by validator.
-	commitMsgs      map[uint64]map[types.Address]*CommitMsg       // Per round, keyed by validator.
-	roundChangeMsgs map[uint64]map[types.Address]*RoundChangeMsg  // Per round, keyed by validator.
-	
-	// Network communication channel
-	msgCh chan interface{}
+	proposalMsgs    map[uint64]*ProposalMsg                         // Map by round.
+	prepareMsgs     map[uint64]map[types.Address]*PrepareMsg          // Per round, keyed by validator.
+	commitMsgs      map[uint64]map[types.Address]*CommitMsg           // Per round, keyed by validator.
+	roundChangeMsgs map[uint64]map[types.Address]*RoundChangeMsg      // Per round, keyed by validator.
 }
 
 // NewIBFT creates a new IBFT consensus instance.
-func NewIBFT(ctx context.Context, config *chain.Params, logger hclog.Logger, initialValidators []*validators.Validator, privateKey *ecdsa.PrivateKey) *IBFT {
+func NewIBFT(ctx context.Context, config *chain.Params, logger hclog.Logger, initialValidators []*validators.Validator) *IBFT {
 	cctx, cancel := context.WithCancel(ctx)
 	if config == nil {
 		config = &chain.Params{
 			BlockTime: 2 * time.Second,
-			GasLimit:  8000000,
 		}
 	}
 	return &IBFT{
@@ -100,7 +90,6 @@ func NewIBFT(ctx context.Context, config *chain.Params, logger hclog.Logger, ini
 		config:          config,
 		validatorSet:    validators.NewValidatorSet(initialValidators),
 		currentRound:    0,
-		privateKey:      privateKey,
 		ctx:             cctx,
 		cancel:          cancel,
 		roundTimeout:    3 * config.BlockTime,
@@ -111,7 +100,6 @@ func NewIBFT(ctx context.Context, config *chain.Params, logger hclog.Logger, ini
 		prepareMsgs:     make(map[uint64]map[types.Address]*PrepareMsg),
 		commitMsgs:      make(map[uint64]map[types.Address]*CommitMsg),
 		roundChangeMsgs: make(map[uint64]map[types.Address]*RoundChangeMsg),
-		msgCh:           make(chan interface{}, 1000),
 	}
 }
 
@@ -123,41 +111,10 @@ func (i *IBFT) VerifyHeader(header *types.Header) error {
 	if header.Number < 0 {
 		return ErrNegativeNumber
 	}
-	
-	// Verify extra data format and seals
-	if err := i.verifyExtraData(header); err != nil {
-		return fmt.Errorf("invalid extra data: %w", err)
-	}
-	
-	// Verify the block creator
 	_, err := i.GetBlockCreator(header)
 	if err != nil {
 		return fmt.Errorf("invalid block creator: %w", err)
 	}
-	
-	// Verify commitSeals in extraData
-	if err := i.verifyCommitSeals(header); err != nil {
-		return fmt.Errorf("invalid commit seals: %w", err)
-	}
-	
-	return nil
-}
-
-// verifyExtraData verifies the IBFT-specific extraData format in the header
-func (i *IBFT) verifyExtraData(header *types.Header) error {
-	// In a production implementation, you would:
-	// 1. Decode the extraData field from the header
-	// 2. Verify its format (typically contains validator list, proposer seal, and commit seals)
-	// 3. Validate that proposer signature is valid
-	return nil
-}
-
-// verifyCommitSeals verifies that commit seals in the header are valid and sufficient
-func (i *IBFT) verifyCommitSeals(header *types.Header) error {
-	// In a production implementation, you would:
-	// 1. Extract commit seals from header's extraData
-	// 2. Verify each seal's validity (signature check)
-	// 3. Count valid seals to ensure quorum
 	return nil
 }
 
@@ -166,12 +123,10 @@ func (i *IBFT) ProcessHeaders(headers []*types.Header) error {
 	if len(headers) == 0 {
 		return ErrNoHeaders
 	}
-	
 	for idx, header := range headers {
 		if err := i.VerifyHeader(header); err != nil {
 			return fmt.Errorf("header verification failed at index %d: %w", idx, err)
 		}
-		
 		// Update state for the last header processed.
 		if idx == len(headers)-1 {
 			i.mu.Lock()
@@ -179,29 +134,23 @@ func (i *IBFT) ProcessHeaders(headers []*types.Header) error {
 			i.lastBlock = header
 			i.mu.Unlock()
 		}
-		
 		i.logger.Info("Processed header",
 			"number", header.Number,
 			"hash", header.Hash().String(),
 			"index", idx,
 			"total", len(headers))
 	}
-	
 	return nil
 }
 
-// GetBlockCreator returns the creator of a given block header by extracting from the header data.
+// GetBlockCreator returns the creator of a given block header by selecting one from the active validator set.
 func (i *IBFT) GetBlockCreator(header *types.Header) (types.Address, error) {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
-	
-	// In a production environment, you should extract the proposer address from the header's extraData
-	// For now, we'll use round-robin selection as a placeholder
 	active := i.validatorSet.GetActiveValidators()
 	if len(active) == 0 {
 		return types.ZeroAddress, ErrNoActiveValidators
 	}
-	
 	index := int(header.Number % uint64(len(active)))
 	creatorAddr := active[index].Address
 	return types.HexToAddress(creatorAddr), nil
@@ -209,33 +158,14 @@ func (i *IBFT) GetBlockCreator(header *types.Header) (types.Address, error) {
 
 // PreCommitState is a hook executed before state transition finalization.
 func (i *IBFT) PreCommitState(header *types.Header, txn interface{}) error {
-	// Set validator set info in the header's extra data
-	validators := i.validatorSet.GetActiveValidators()
-	addresses := make([]types.Address, len(validators))
-	
-	for idx, validator := range validators {
-		addresses[idx] = types.HexToAddress(validator.Address)
-	}
-	
-	// In production, encode the validators into the extraData field with proper format
-	// This is just a placeholder implementation
+	// Future: Implement state adjustments before commit.
 	return nil
 }
 
 // GetSyncProgression returns sync progression details.
 func (i *IBFT) GetSyncProgression() interface{} {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	
-	return struct {
-		CurrentHeight uint64 `json:"currentHeight"`
-		HighestBlock  uint64 `json:"highestBlock"`
-		IsSyncing     bool   `json:"isSyncing"`
-	}{
-		CurrentHeight: i.height,
-		HighestBlock:  i.height, // In production, this would be the highest known block
-		IsSyncing:     false,    // In production, determine if syncing is in progress
-	}
+	// Future: Return actual sync progression info.
+	return nil
 }
 
 // Initialize sets up the IBFT consensus engine.
@@ -243,207 +173,7 @@ func (i *IBFT) Initialize() error {
 	i.logger.Info("IBFT consensus engine initialized",
 		"validators", len(i.validatorSet.GetActiveValidators()),
 		"roundTimeout", i.roundTimeout)
-	
-	// Set up message handlers and networking
-	go i.handleMessages()
-	
 	return nil
-}
-
-// handleMessages processes incoming consensus messages
-func (i *IBFT) handleMessages() {
-	for {
-		select {
-		case <-i.ctx.Done():
-			return
-		case msg := <-i.msgCh:
-			switch m := msg.(type) {
-			case *ProposalMsg:
-				i.handleProposalMsg(m)
-			case *PrepareMsg:
-				i.handlePrepareMsg(m)
-			case *CommitMsg:
-				i.handleCommitMsg(m)
-			case *RoundChangeMsg:
-				i.handleRoundChangeMsg(m)
-			default:
-				i.logger.Warn("Unknown message type received")
-			}
-		}
-	}
-}
-
-// handleProposalMsg processes incoming proposal messages
-func (i *IBFT) handleProposalMsg(msg *ProposalMsg) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	
-	if msg.Round < i.currentRound {
-		i.logger.Debug("Ignoring proposal from older round", 
-			"msgRound", msg.Round, 
-			"currentRound", i.currentRound)
-		return
-	}
-	
-	// Verify proposal signature
-	if !i.verifySignature(msg.Proposer, msg.Block.Hash().Bytes(), msg.Signature) {
-		i.logger.Warn("Invalid proposal signature", 
-			"proposer", msg.Proposer.String(),
-			"round", msg.Round)
-		return
-	}
-	
-	i.proposalMsgs[msg.Round] = msg
-	i.logger.Info("Stored proposal message", 
-		"round", msg.Round, 
-		"proposer", msg.Proposer.String(),
-		"blockHeight", msg.Block.Number())
-	
-	// If valid, broadcast prepare message
-	i.broadcastPrepare(msg.Round, msg.Block.Hash())
-}
-
-// handlePrepareMsg processes incoming prepare messages
-func (i *IBFT) handlePrepareMsg(msg *PrepareMsg) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	
-	if msg.Round < i.currentRound {
-		return // Ignore old rounds
-	}
-	
-	// Verify prepare signature
-	if !i.verifySignature(msg.Validator, msg.BlockHash.Bytes(), msg.Signature) {
-		i.logger.Warn("Invalid prepare signature", 
-			"validator", msg.Validator.String())
-		return
-	}
-	
-	// Initialize map for this round if needed
-	if i.prepareMsgs[msg.Round] == nil {
-		i.prepareMsgs[msg.Round] = make(map[types.Address]*PrepareMsg)
-	}
-	
-	i.prepareMsgs[msg.Round][msg.Validator] = msg
-	i.logger.Debug("Stored prepare message", 
-		"round", msg.Round, 
-		"validator", msg.Validator.String())
-	
-	// Check if we have enough prepares to send commit
-	if len(i.prepareMsgs[msg.Round]) >= i.validatorSet.RequiredVotes() {
-		proposal, exists := i.proposalMsgs[msg.Round]
-		if exists {
-			i.broadcastCommit(msg.Round, proposal.Block.Hash())
-		}
-	}
-}
-
-// handleCommitMsg processes incoming commit messages
-func (i *IBFT) handleCommitMsg(msg *CommitMsg) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	
-	if msg.Round < i.currentRound {
-		return // Ignore old rounds
-	}
-	
-	// Verify commit signature
-	if !i.verifySignature(msg.Validator, msg.BlockHash.Bytes(), msg.CommitSeal) {
-		i.logger.Warn("Invalid commit seal", 
-			"validator", msg.Validator.String())
-		return
-	}
-	
-	// Initialize map for this round if needed
-	if i.commitMsgs[msg.Round] == nil {
-		i.commitMsgs[msg.Round] = make(map[types.Address]*CommitMsg)
-	}
-	
-	i.commitMsgs[msg.Round][msg.Validator] = msg
-	i.logger.Debug("Stored commit message", 
-		"round", msg.Round, 
-		"validator", msg.Validator.String())
-	
-	// Check if we have enough commits to finalize
-	if len(i.commitMsgs[msg.Round]) >= i.validatorSet.RequiredVotes() {
-		proposal, exists := i.proposalMsgs[msg.Round]
-		if exists {
-			i.finalizeBlock(proposal.Block, msg.Round)
-		}
-	}
-}
-
-// handleRoundChangeMsg processes incoming round change messages
-func (i *IBFT) handleRoundChangeMsg(msg *RoundChangeMsg) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	
-	// Verify round change signature
-	if !i.verifySignature(msg.Validator, big.NewInt(int64(msg.NewRound)).Bytes(), msg.Signature) {
-		i.logger.Warn("Invalid round change signature", 
-			"validator", msg.Validator.String())
-		return
-	}
-	
-	// Initialize map for current round if needed
-	if i.roundChangeMsgs[i.currentRound] == nil {
-		i.roundChangeMsgs[i.currentRound] = make(map[types.Address]*RoundChangeMsg)
-	}
-	
-	i.roundChangeMsgs[i.currentRound][msg.Validator] = msg
-	i.logger.Debug("Stored round change message", 
-		"currentRound", i.currentRound, 
-		"newRound", msg.NewRound,
-		"validator", msg.Validator.String())
-	
-	// Check if we should change round
-	roundChangeCount := 0
-	targetRound := uint64(0)
-	
-	// Count round changes for each proposed new round
-	roundVotes := make(map[uint64]int)
-	for _, rcMsg := range i.roundChangeMsgs[i.currentRound] {
-		roundVotes[rcMsg.NewRound]++
-		if roundVotes[rcMsg.NewRound] > roundChangeCount {
-			roundChangeCount = roundVotes[rcMsg.NewRound]
-			targetRound = rcMsg.NewRound
-		}
-	}
-	
-	// If we have enough votes, change to the new round
-	if roundChangeCount >= i.validatorSet.RequiredVotes() && targetRound > i.currentRound {
-		i.logger.Info("Changing round based on votes", 
-			"oldRound", i.currentRound, 
-			"newRound", targetRound)
-		i.currentRound = targetRound
-		// Reset messages for the new round
-		i.prepareMsgs[targetRound] = make(map[types.Address]*PrepareMsg)
-		i.commitMsgs[targetRound] = make(map[types.Address]*CommitMsg)
-	}
-}
-
-// finalizeBlock finalizes a block for the given round
-func (i *IBFT) finalizeBlock(block *types.Block, round uint64) {
-	// In production, this would:
-	// 1. Collect commit seals from commitMsgs
-	// 2. Append the seals to the block's extraData
-	// 3. Finalize the block and add it to the chain
-	// 4. Update height and lastBlock
-	
-	i.height = block.Number()
-	i.lastBlock = block.Header
-	i.currentRound = 0 // Reset round for next height
-	
-	// Clear message pools for the finalized round
-	delete(i.proposalMsgs, round)
-	delete(i.prepareMsgs, round)
-	delete(i.commitMsgs, round)
-	delete(i.roundChangeMsgs, round)
-	
-	i.logger.Info("Block finalized", 
-		"height", block.Number(), 
-		"hash", block.Hash().String(), 
-		"round", round)
 }
 
 // Start begins the consensus process.
@@ -463,9 +193,7 @@ func (i *IBFT) consensusLoop() {
 			return
 		default:
 			if err := i.runRoundWithTimeout(); err != nil {
-				if !errors.Is(err, ErrRoundTimeout) {
-					i.logger.Error("Error in consensus round", "error", err)
-				}
+				i.logger.Error("Error in consensus round", "error", err)
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -483,7 +211,9 @@ func (i *IBFT) runRoundWithTimeout() error {
 	roundCtx, cancel := context.WithTimeout(i.ctx, i.roundTimeout)
 	defer cancel()
 
-	// Calculate the proposer for this round
+	// Broadcast Proposal if this node is proposer.
+	// For simplicity, we assume that if our node is the proposer,
+	// i.logger.Info logs the proposal sending.
 	proposer, err := i.CalculateProposer(current, types.ZeroAddress)
 	if err != nil {
 		i.logger.Error("Failed to calculate proposer", "error", err)
@@ -491,18 +221,18 @@ func (i *IBFT) runRoundWithTimeout() error {
 		return err
 	}
 
-	// Check if this node is the proposer
-	selfAddress := types.HexToAddress(i.config.SelfAddress)
+	// Mark proposer flag based on configuration (assuming config has SelfAddress).
 	i.mu.Lock()
-	i.isProposer = (types.HexToAddress(proposer.Address) == selfAddress)
+	if types.HexToAddress(proposer.Address) == types.HexToAddress(i.config.SelfAddress) {
+		i.isProposer = true
+	} else {
+		i.isProposer = false
+	}
 	i.mu.Unlock()
 
-	i.logger.Info("Selected proposer", 
-		"address", proposer.Address, 
-		"round", current, 
-		"isProposer", i.isProposer)
+	i.logger.Info("Selected proposer", "address", proposer.Address, "round", current, "isProposer", i.isProposer)
 
-	// If we're the proposer, broadcast the proposal
+	// Broadcast the proposal message.
 	if i.isProposer {
 		if err := i.broadcastProposal(current); err != nil {
 			i.logger.Error("Failed to broadcast proposal", "error", err)
@@ -511,22 +241,19 @@ func (i *IBFT) runRoundWithTimeout() error {
 		}
 	}
 
-	// Wait for consensus to complete or timeout
+	// Wait for commit messages until round timeout.
 	select {
 	case <-roundCtx.Done():
-		// Check if we have enough commits for finality
+		// Check if sufficient commits have been collected.
 		if !i.hasQuorum(current) {
 			i.logger.Warn("Round timed out without quorum", "round", current)
 			i.broadcastRoundChange(current)
 			i.advanceRound()
-			return ErrRoundTimeout
 		} else {
-			i.logger.Info("Round completed with quorum", "round", current)
-			return nil
+			i.logger.Info("Round completed successfully", "round", current)
 		}
-	case <-i.ctx.Done():
-		return i.ctx.Err()
 	}
+	return nil
 }
 
 // advanceRound safely advances to the next consensus round.
@@ -571,9 +298,6 @@ func (i *IBFT) CalculateProposer(round uint64, lastProposer types.Address) (vali
 	if len(active) == 0 {
 		return validators.Validator{}, ErrNoActiveValidators
 	}
-	
-	// In production, implement a more sophisticated selection algorithm
-	// For example, using the round and previous proposer for secure rotation
 	index := int(round % uint64(len(active)))
 	return *active[index], nil
 }
@@ -582,127 +306,72 @@ func (i *IBFT) CalculateProposer(round uint64, lastProposer types.Address) (vali
 
 // broadcastProposal broadcasts a proposal message for the current round.
 func (i *IBFT) broadcastProposal(round uint64) error {
-	// Assemble the block proposal
-	block := i.assembleBlockProposal(round)
-	if block == nil {
-		return errors.New("failed to assemble block proposal")
-	}
-	
-	// Sign the block hash
-	signature, err := i.signData(block.Hash().Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to sign proposal: %w", err)
-	}
-	
+	// Assemble the proposal message.
+	// For production, include cryptographic signing of block and round data.
 	proposal := &ProposalMsg{
-		Round:     round,
-		Block:     block,
-		Proposer:  types.HexToAddress(i.config.SelfAddress),
-		Signature: signature,
+		Round:    round,
+		Block:    i.assembleBlockProposal(round),
+		Proposer: types.HexToAddress(i.config.SelfAddress),
+		Signature: []byte("signature"), // Replace with actual signature.
 	}
-	
 	i.mu.Lock()
 	i.proposalMsgs[round] = proposal
 	i.mu.Unlock()
-	
-	i.logger.Info("Proposal broadcast", 
-		"round", round, 
-		"blockNum", block.Number(), 
-		"hash", block.Hash().String())
-	
-	// In production, send this message to all validators via network
+	i.logger.Info("Proposal broadcast", "round", round, "proposer", proposal.Proposer.String())
+	// In production, broadcast over the network.
 	return nil
 }
 
 // broadcastPrepare broadcasts a prepare message for a given round and block hash.
 func (i *IBFT) broadcastPrepare(round uint64, blockHash types.Hash) error {
-	// Sign the block hash
-	signature, err := i.signData(blockHash.Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to sign prepare message: %w", err)
-	}
-	
 	prepare := &PrepareMsg{
 		Round:     round,
 		BlockHash: blockHash,
 		Validator: types.HexToAddress(i.config.SelfAddress),
-		Signature: signature,
+		Signature: []byte("prepare-signature"),
 	}
-	
 	i.mu.Lock()
 	if i.prepareMsgs[round] == nil {
 		i.prepareMsgs[round] = make(map[types.Address]*PrepareMsg)
 	}
 	i.prepareMsgs[round][prepare.Validator] = prepare
 	i.mu.Unlock()
-	
-	i.logger.Info("Prepare message broadcast", 
-		"round", round, 
-		"blockHash", blockHash.String())
-	
-	// In production, send this message to all validators via network
+	i.logger.Info("Prepare message broadcast", "round", round, "validator", prepare.Validator.String())
 	return nil
 }
 
 // broadcastCommit broadcasts a commit message for a given round and block hash.
 func (i *IBFT) broadcastCommit(round uint64, blockHash types.Hash) error {
-	// Sign the block hash to create the commit seal
-	commitSeal, err := i.signData(blockHash.Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to create commit seal: %w", err)
-	}
-	
 	commit := &CommitMsg{
 		Round:      round,
 		BlockHash:  blockHash,
 		Validator:  types.HexToAddress(i.config.SelfAddress),
-		CommitSeal: commitSeal,
+		CommitSeal: []byte("commit-seal"),
 	}
-	
 	i.mu.Lock()
 	if i.commitMsgs[round] == nil {
 		i.commitMsgs[round] = make(map[types.Address]*CommitMsg)
 	}
 	i.commitMsgs[round][commit.Validator] = commit
 	i.mu.Unlock()
-	
-	i.logger.Info("Commit message broadcast", 
-		"round", round, 
-		"blockHash", blockHash.String())
-	
-	// In production, send this message to all validators via network
+	i.logger.Info("Commit message broadcast", "round", round, "validator", commit.Validator.String())
 	return nil
 }
 
 // broadcastRoundChange broadcasts a round-change message for the current round.
 func (i *IBFT) broadcastRoundChange(round uint64) error {
-	// New round is current round + 1
-	newRound := round + 1
-	
-	// Sign the new round number
-	signature, err := i.signData(big.NewInt(int64(newRound)).Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to sign round change: %w", err)
-	}
-	
 	roundChange := &RoundChangeMsg{
-		NewRound:  newRound,
+		NewRound:  round + 1,
 		Validator: types.HexToAddress(i.config.SelfAddress),
-		Signature: signature,
+		Signature: []byte("round-change-signature"),
 	}
-	
 	i.mu.Lock()
 	if i.roundChangeMsgs[round] == nil {
 		i.roundChangeMsgs[round] = make(map[types.Address]*RoundChangeMsg)
 	}
 	i.roundChangeMsgs[round][roundChange.Validator] = roundChange
 	i.mu.Unlock()
-	
-	i.logger.Info("Round-Change message broadcast", 
-		"oldRound", round, 
-		"newRound", newRound)
-	
-	// In production, send this message to all validators via network
+	i.logger.Info("Round-Change message broadcast", "oldRound", round, "newRound", roundChange.NewRound)
 	return nil
 }
 
@@ -710,86 +379,24 @@ func (i *IBFT) broadcastRoundChange(round uint64) error {
 func (i *IBFT) hasQuorum(round uint64) bool {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
-	
 	commits, exists := i.commitMsgs[round]
 	if !exists {
 		return false
 	}
-	
 	return len(commits) >= i.validatorSet.RequiredVotes()
 }
 
-// assembleBlockProposal constructs a complete block proposal for the current round.
+// assembleBlockProposal constructs a block proposal for the current round.
+// In production, this would gather transactions and form a complete block.
 func (i *IBFT) assembleBlockProposal(round uint64) *types.Block {
-	i.mu.RLock()
-	currentHeight := i.height
-	lastBlock := i.lastBlock
-	i.mu.RUnlock()
-	
-	// Create the new block header
+	// Placeholder: construct a dummy block proposal based on current height and round.
 	header := &types.Header{
-		ParentHash: types.ZeroHash,
-		Number:     int64(currentHeight + 1),
-		Timestamp:  uint64(time.Now().Unix()),
-		GasLimit:   i.config.GasLimit,
-		Difficulty: big.NewInt(1), // Constant for PoS
-		Coinbase:   types.HexToAddress(i.config.SelfAddress),
+		Number: int64(i.height + 1),
+		Timestamp: uint64(time.Now().Unix()),
+		GasLimit: i.config.GasLimit,
 	}
-	
-	// Set parent hash if we have a last block
-	if lastBlock != nil {
-		header.ParentHash = lastBlock.Hash()
+	// In production, populate the block with transactions.
+	return &types.Block{
+		Header: header,
 	}
-	
-	// In production:
-	// 1. Collect pending transactions from transaction pool
-	// 2. Execute them to get state root
-	// 3. Set transaction root, receipts root, etc.
-	
-	// Create the block with transactions
-	block := &types.Block{
-		Header:       header,
-		Transactions: []*types.Transaction{}, // In production, include actual transactions
-	}
-	
-	// Add extra data with validator info and proposer signature
-	// This is a placeholder for the full implementation
-	// In production, encode all required consensus data into extraData
-	
-	return block
-}
-
-// signData signs data with the node's private key
-func (i *IBFT) signData(data []byte) ([]byte, error) {
-	// In production, implement actual cryptographic signing
-	// For example, using ECDSA with the node's private key
-	if i.privateKey == nil {
-		return nil, errors.New("private key not available")
-	}
-	
-	// This is a placeholder for the actual signing logic
-	// In production, use proper crypto package
-	signature, err := crypto.Sign(data, i.privateKey)
-	if err != nil {
-		return nil, err
-	}
-	
-	return signature, nil
-}
-
-// verifySignature verifies a signature against an address and data
-func (i *IBFT) verifySignature(address types.Address, data []byte, signature []byte) bool {
-	// In production, implement actual signature verification
-	// For example, recover the public key and verify it matches the address
-	
-	// This is a placeholder for the actual verification logic
-	// In production, use proper crypto package
-	publicKey, err := crypto.RecoverPubkey(data, signature)
-	if err != nil {
-		i.logger.Debug("Failed to recover public key", "error", err)
-		return false
-	}
-	
-	recoveredAddr := crypto.PubkeyToAddress(*publicKey)
-	return recoveredAddr == address
 }
