@@ -1,4 +1,4 @@
-module github.com/0xPolygon/polygon-edge
+module github.com/hotenglish775/mainnet
 
 go 1.18
 
@@ -59,7 +59,7 @@ require (
 	lukechampine.com/blake3 v1.1.7 // indirect
 )
 
-require github.com/0xPolygon/go-ibft v0.0.0-20220810095021-e43142f8d267
+require github.com/0xPolygon/go-ibft@v0.4.0
 
 require gopkg.in/DataDog/dd-trace-go.v1 v1.43.1
 
